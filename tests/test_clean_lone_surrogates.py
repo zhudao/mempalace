@@ -21,7 +21,6 @@ import hashlib
 
 from mempalace.config import strip_lone_surrogates
 
-
 # ── Unit tests ─────────────────────────────────────────────────────────────
 
 
@@ -177,3 +176,109 @@ class TestToolsAcceptSurrogates:
             topic="log",
         )
         assert result["success"] is True
+
+
+# ── Backend chokepoint (bulk ingest paths) ──────────────────────────────────
+
+
+class _CapturingCollection:
+    """Minimal chromadb.Collection stand-in that records the kwargs it receives,
+    so we can assert what actually reaches the chromadb client."""
+
+    def __init__(self):
+        self.calls = []
+
+    def add(self, **kwargs):
+        self.calls.append(("add", kwargs))
+
+    def upsert(self, **kwargs):
+        self.calls.append(("upsert", kwargs))
+
+    def update(self, **kwargs):
+        self.calls.append(("update", kwargs))
+
+
+def _stored_docs(kwargs):
+    """Documents as a reader gets them back from what reached chromadb."""
+    from mempalace.stored_text import restore_rows
+
+    docs = kwargs["documents"]
+    single = isinstance(docs, str)
+    docs, _ = restore_rows([docs] if single else docs, kwargs["metadatas"])
+    return docs[0] if single else docs
+
+
+class TestBackendChokepointStripsDocuments:
+    """#1235 sanitised the MCP write tools, but the bulk ingest paths
+    (miner, convo_miner, sweeper, diary_ingest) build documents without routing
+    through ``sanitize_content`` and reach ``ChromaCollection`` directly. A lone
+    surrogate in *document* text crashes the whole add/upsert batch (-32000),
+    silently dropping the other rows. The backend chokepoint must strip
+    documents, mirroring ``_sanitize_metadatas_for_chromadb``."""
+
+    @staticmethod
+    def _collection():
+        from mempalace.backends.chroma import ChromaCollection
+
+        fake = _CapturingCollection()
+        return fake, ChromaCollection(fake)
+
+    def test_add_strips_lone_surrogate_in_document(self):
+        fake, col = self._collection()
+        col.add(documents=["clean\udc95doc"], ids=["1"])
+        _, kwargs = fake.calls[0]
+        stored = kwargs["documents"][0]
+        stored.encode("utf-8")
+        assert "\udc95" not in stored
+        assert _stored_docs(kwargs)[0] == "clean\udc95doc"
+
+    def test_upsert_strips_lone_surrogate_in_document(self):
+        fake, col = self._collection()
+        col.upsert(documents=["a\ud800b"], ids=["1"], metadatas=[{"wing": "w"}])
+        _, kwargs = fake.calls[0]
+        stored = kwargs["documents"][0]
+        stored.encode("utf-8")
+        assert _stored_docs(kwargs)[0] == "a\ud800b"
+
+    def test_update_strips_lone_surrogate_in_document(self):
+        fake, col = self._collection()
+        col.update(ids=["1"], documents=["x\udcffy"])
+        _, kwargs = fake.calls[0]
+        stored = kwargs["documents"][0]
+        stored.encode("utf-8")
+        assert _stored_docs(kwargs)[0] == "x\udcffy"
+
+    def test_one_poison_message_does_not_drop_the_batch(self):
+        """A single bad row used to abort the entire batch, silently dropping
+        the others. After sanitising, every row survives."""
+        fake, col = self._collection()
+        col.upsert(
+            documents=["ok one", "poison\udc95row", "ok three"],
+            ids=["1", "2", "3"],
+        )
+        _, kwargs = fake.calls[0]
+        assert _stored_docs(kwargs) == [
+            "ok one",
+            "poison\udc95row",
+            "ok three",
+        ]
+        assert len(kwargs["ids"]) == 3
+        for doc in kwargs["documents"]:
+            doc.encode("utf-8")
+
+    def test_real_emoji_and_none_metadata_preserved(self):
+        fake, col = self._collection()
+        col.add(documents=["ship \U0001f680"], ids=["1"])
+        _, kwargs = fake.calls[0]
+        assert kwargs["documents"] == ["ship \U0001f680"]
+
+    def test_single_string_document_is_not_split_into_chars(self):
+        """chromadb accepts a bare str as one document (OneOrMany[Document]).
+        The sanitiser must keep it whole and clean, not split it into
+        per-character documents."""
+        fake, col = self._collection()
+        col.upsert(documents="one\udc95document", ids=["1"])
+        _, kwargs = fake.calls[0]
+        assert isinstance(kwargs["documents"], str)
+        kwargs["documents"].encode("utf-8")
+        assert _stored_docs(kwargs) == "one\udc95document"
