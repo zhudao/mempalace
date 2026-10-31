@@ -10,6 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Registered Chinese, Japanese, and Korean entities are tagged when adjacent to
+  other words or particles. Mixed-script names retain word boundaries on their
+  non-CJK edges.
 - Conversation mining compares transcript timestamps by instant rather than
   text order, so mixed UTC offsets and fractional seconds select the correct
   authored time. Invalid timestamps are ignored.
